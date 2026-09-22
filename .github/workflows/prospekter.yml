@@ -1,9 +1,12 @@
-name: Daglig fiber-prospektering
+name: Fiber-prospektering
 
 on:
-  schedule:
-    - cron: '0 1 * * *'
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      postnummer:
+        description: "Postnummer som skal prospekteres"
+        required: true
+        type: string
 
 permissions:
   contents: write
@@ -22,7 +25,7 @@ jobs:
         env:
           NETHUNT_EMAIL: ${{ secrets.NETHUNT_EMAIL }}
           NETHUNT_API_KEY: ${{ secrets.NETHUNT_API_KEY }}
-        run: python prospekter_cloud.py --postnummer 3510
+        run: python prospekter_cloud.py --postnummer "${{ inputs.postnummer }}"
       - name: Commit oppdatert duplikat-liste
         run: |
           git config user.name "prospekter-bot"
