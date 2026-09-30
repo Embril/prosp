@@ -2,17 +2,26 @@
 """
 Automatisert prospektering - kjørt av en Claude Code sky-rutine (cron).
 
-Henter bedrifter fra Brreg for et gitt postnummer, hopper over de som allerede
-finnes i seen_orgnr.json (i dette repoet - committes tilbake etter hver kjøring),
-henter kontaktperson (Brreg-roller), prøver å finne telefonnummer på proff.no og
-1881.no, og oppretter kontaktperson + lead i NetHunt CRM via NetHunt sitt
-legacy REST API (Basic Auth).
+Henter bedrifter fra Brreg for enten et gitt postnummer eller et helt poststed
+(f.eks. hele "PORSGRUNN", som dekker mange postnummer), hopper over de som
+allerede finnes i seen_orgnr.json (i dette repoet - committes tilbake etter
+hver kjøring), henter kontaktperson (Brreg-roller), prøver å finne
+telefonnummer på proff.no og 1881.no, og oppretter kontaktperson + lead i
+NetHunt CRM via NetHunt sitt legacy REST API (Basic Auth).
 
-VIKTIG: Gjør IKKE næring/privat-sjekk via Kartserver.no - det krever personlig
-innlogging og gjøres manuelt/interaktivt i etterkant.
+Næring/privat-sjekk skjer FØR en record opprettes, via Kartverkets offisielle
+Eiendomsregisteret (eiendomsregisteret.kartverket.no) - offentlig API, ingen
+innlogging nødvendig. Kandidater der ingen bygning har en næringsgruppe
+(butikk, kontor, landbruk, osv.) hoppes over, det samme gjelder konkursbo.
+
+Enkeltpersonforetak (ENK), boligsameier/eierseksjonssameier (navn inneholder
+"SAMEIE"), skoler (navn inneholder "SKOLE") og utenlandske NUF-selskaper
+(navn inneholder "LTD") filtreres bort - for mange hjemmekontor/irrelevante
+treff (samme filter som i søster-repoet Embril/prospektering).
 
 Krever miljøvariabler: NETHUNT_EMAIL, NETHUNT_API_KEY
 Bruk: python prospekter_cloud.py --postnummer 3510
+  eller: python prospekter_cloud.py --poststed PORSGRUNN
 """
 
 import argparse
@@ -27,13 +36,54 @@ from pathlib import Path
 import requests
 
 BRREG_API_BASE = "https://data.brreg.no/enhetsregisteret/api/enheter"
+EIENDOM_API_BASE = "https://eiendomsregisteret.kartverket.no/api"
 NETHUNT_BASE = "https://nethunt.com/api/v1/zapier"
 FIBER_PIPE_FOLDER = "65afc684f6048909bb640cbb"
 KUNDEKONTAKTER_FOLDER = "65afc684f6048909bb640cb9"
 SEEN_FILE = Path(__file__).parent / "seen_orgnr.json"
 
-ORG_FORMS = ["AS", "ENK", "ANS", "DA"]
+ORG_FORMS = ["AS", "ANS", "DA"]
+EXCLUDED_NAME_SUBSTRINGS = ("SAMEIE", "SKOLE", "LTD")
+# naeringsgruppe-verdier som IKKE regnes som næringsbygg (rene boliger/uthus
+# eller ukjent - en "Ukjent" gruppe skal ikke i seg selv trigge "næring").
+IKKE_NARING_GRUPPER = {"", "Bolig", "Annet som ikke er næring", "Ukjent"}
 UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+
+
+def is_excluded_name(navn: str) -> bool:
+    return any(s in navn.upper() for s in EXCLUDED_NAME_SUBSTRINGS)
+
+
+def naeringsstatus(navn: str, adresse: str) -> str:
+    """Returnerer "naring", "privat" eller "usikker" (adressen ga ikke treff)."""
+    if "KONKURSBO" in navn.upper():
+        return "privat"  # ikke en reell kjøper uansett byggtype
+    try:
+        resp = requests.get(
+            f"{EIENDOM_API_BASE}/soekEtterEiendom",
+            params={"searchstring": adresse}, headers=UA, timeout=20,
+        )
+        if resp.status_code != 200:
+            return "usikker"
+        enheter = resp.json().get("matrikkelenheter") or []
+        if not enheter:
+            return "usikker"
+        m = enheter[0]
+        resp2 = requests.get(
+            f"{EIENDOM_API_BASE}/bygningerForMatrikkelenhet/{m['id']}",
+            headers=UA, timeout=20,
+        )
+        if resp2.status_code != 200:
+            return "usikker"
+        bygg = resp2.json()
+        if not bygg:
+            return "usikker"
+        er_naring = any(
+            (b.get("naeringsgruppe") or "") not in IKKE_NARING_GRUPPER for b in bygg
+        )
+        return "naring" if er_naring else "privat"
+    except requests.RequestException:
+        return "usikker"
 
 
 def nethunt_auth_header() -> dict:
@@ -55,16 +105,23 @@ def save_seen(seen: set) -> None:
     )
 
 
-def fetch_companies(postnummer: str, org_forms: list[str] = ORG_FORMS) -> list[dict]:
+def fetch_companies(
+    postnummer: str | None = None,
+    poststed: str | None = None,
+    org_forms: list[str] = ORG_FORMS,
+) -> list[dict]:
     companies: list[dict] = []
     page = 0
     while True:
         params = {
             "organisasjonsform": ",".join(org_forms),
-            "forretningsadresse.postnummer": postnummer,
             "size": 100,
             "page": page,
         }
+        if postnummer:
+            params["forretningsadresse.postnummer"] = postnummer
+        if poststed:
+            params["forretningsadresse.poststed"] = poststed
         resp = requests.get(BRREG_API_BASE, params=params, timeout=30)
         resp.raise_for_status()
         data = resp.json()
@@ -83,6 +140,8 @@ def is_relevant(company: dict) -> bool:
     if company.get("underAvvikling"):
         return False
     if not company.get("forretningsadresse"):
+        return False
+    if is_excluded_name(company.get("navn", "")):
         return False
     return True
 
@@ -219,8 +278,12 @@ def create_nethunt_lead(company: dict, contact_id, person, phone) -> bool:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--postnummer", required=True)
+    parser.add_argument("--postnummer")
+    parser.add_argument("--poststed")
     args = parser.parse_args()
+
+    if not args.postnummer and not args.poststed:
+        parser.error("må oppgi enten --postnummer eller --poststed")
 
     missing = [n for n in ("NETHUNT_EMAIL", "NETHUNT_API_KEY") if not os.environ.get(n)]
     if missing:
@@ -228,17 +291,30 @@ def main() -> None:
         sys.exit(1)
 
     seen = load_seen()
-    all_companies = fetch_companies(args.postnummer)
+    all_companies = fetch_companies(postnummer=args.postnummer, poststed=args.poststed)
     relevant = [c for c in all_companies if is_relevant(c)]
     new_companies = [c for c in relevant if c.get("organisasjonsnummer") not in seen]
 
     added = 0
     failed = 0
+    skipped_privat = 0
+    usikker = 0
 
     for company in new_companies:
         orgnr = company.get("organisasjonsnummer")
         navn = company.get("navn", "")
-        print(f"Behandler {navn} ({orgnr})...", file=sys.stderr)
+        adresse = address_string(company)
+
+        status = naeringsstatus(navn, adresse)
+        if status == "privat":
+            print(f"Hopper over {navn} ({orgnr}) - privatbolig/konkursbo", file=sys.stderr)
+            skipped_privat += 1
+            seen.add(orgnr)  # ikke prøv på nytt neste kjøring
+            continue
+        if status == "usikker":
+            usikker += 1  # opprettes likevel - manuell vurdering senere
+
+        print(f"Behandler {navn} ({orgnr}, {status})...", file=sys.stderr)
 
         person = fetch_contact_person(orgnr)
         contact_id = None
@@ -265,10 +341,13 @@ def main() -> None:
 
     summary = {
         "postnummer": args.postnummer,
+        "poststed": args.poststed,
         "totalt_funnet": len(relevant),
         "allerede_kjent": len(relevant) - len(new_companies),
         "nye_lagt_til": added,
         "feilet": failed,
+        "hoppet_over_privat": skipped_privat,
+        "usikker_men_opprettet": usikker,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
 

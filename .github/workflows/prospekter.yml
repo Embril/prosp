@@ -3,8 +3,8 @@ name: Fiber-prospektering
 on:
   workflow_dispatch:
     inputs:
-      postnummer:
-        description: "Postnummer som skal prospekteres"
+      omrade:
+        description: "Postnummer (f.eks. 3510) eller poststed (f.eks. PORSGRUNN) som skal prospekteres"
         required: true
         type: string
 
@@ -25,7 +25,13 @@ jobs:
         env:
           NETHUNT_EMAIL: ${{ secrets.NETHUNT_EMAIL }}
           NETHUNT_API_KEY: ${{ secrets.NETHUNT_API_KEY }}
-        run: python prospekter_cloud.py --postnummer "${{ inputs.postnummer }}"
+          OMRADE: ${{ inputs.omrade }}
+        run: |
+          if [[ "$OMRADE" =~ ^[0-9]+$ ]]; then
+            python prospekter_cloud.py --postnummer "$OMRADE"
+          else
+            python prospekter_cloud.py --poststed "$OMRADE"
+          fi
       - name: Commit oppdatert duplikat-liste
         run: |
           git config user.name "prospekter-bot"
